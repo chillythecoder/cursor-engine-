@@ -1,5 +1,5 @@
 """Cursor Engine core: image/GIF -> .cur/.ani -> applied as Windows cursor."""
-import ctypes, itertools, json, os, struct
+import ctypes, io, itertools, json, os, shutil, struct
 from pathlib import Path
 from PIL import Image, ImageSequence
 
@@ -63,8 +63,75 @@ def make_ani(frames, delays, hx, hy):
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
+# ---------- existing .cur / .ani files ----------
+NATIVE = {".cur", ".ani"}
+
+
+def is_native(path):
+    return Path(path).suffix.lower() in NATIVE
+
+
+def _open_cur(data):
+    return Image.open(io.BytesIO(data)).convert("RGBA")
+
+
+def read_native(path, max_frames=120):
+    """Read an existing .cur or .ani. Returns (frames, delays_ms)."""
+    data = Path(path).read_bytes()
+    if data[:4] != b"RIFF":                       # plain .cur
+        return [_open_cur(data)], [100]
+    if data[8:12] != b"ACON":
+        raise ValueError("That doesn't look like a valid .ani file")
+    icons, rates, seq, default = [], [], [], 10
+
+    def walk(pos, end):
+        nonlocal rates, seq, default
+        while pos + 8 <= end:
+            tag, size = data[pos:pos + 4], struct.unpack("<I", data[pos + 4:pos + 8])[0]
+            body = data[pos + 8:pos + 8 + size]
+            if tag == b"LIST":
+                if body[:4] == b"fram":
+                    walk(pos + 12, pos + 8 + size)
+            elif tag == b"icon":
+                icons.append(body)
+            elif tag == b"anih" and size >= 32:
+                default = struct.unpack("<I", body[28:32])[0] or 10
+            elif tag == b"rate":
+                rates = list(struct.unpack(f"<{size // 4}I", body))
+            elif tag == b"seq ":
+                seq = list(struct.unpack(f"<{size // 4}I", body))
+            pos += 8 + size + (size % 2)
+
+    walk(12, len(data))
+    if not icons:
+        raise ValueError("No frames found in that .ani file")
+    raw = [_open_cur(b) for b in icons]
+    frames, delays = [], []
+    for i, step in enumerate((seq or list(range(len(raw))))[:max_frames]):
+        if step < len(raw):
+            frames.append(raw[step])
+            jif = rates[i] if i < len(rates) else default
+            delays.append(max(1, round(jif * 1000 / 60)))
+    return frames, delays
+
+
+def load_any(path, size=48, center=False):
+    """Frames + delays for preview, for images, GIFs, .cur and .ani alike."""
+    if is_native(path):
+        return read_native(path)
+    frames, delays, _ = load_frames(path, size, center)
+    return frames, delays
+
+
 def build_cursor(src, size=48, center=False):
-    """Convert any image/GIF file into a cursor file. Returns (path, frame_count)."""
+    """Convert any image/GIF into a cursor file (or reuse a .cur/.ani as-is). Returns (path, frames)."""
+    if is_native(src):
+        frames, _ = read_native(src)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        out = OUT_DIR / Path(src).name
+        if Path(src).resolve() != out.resolve():
+            shutil.copy2(src, out)
+        return out, len(frames)
     frames, delays, (hx, hy) = load_frames(src, size, center)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     stem = Path(src).stem
@@ -108,3 +175,48 @@ def reset_cursors():
             winreg.SetValueEx(k, r, 0, winreg.REG_EXPAND_SZ, v)
     BACKUP.unlink(missing_ok=True)
     _refresh()
+
+
+# ---------- cursor library (so you can switch between past cursors) ----------
+LIB_DIR = APP_DIR / "library"
+LIB_FILE = APP_DIR / "library.json"
+
+
+def load_library():
+    try:
+        return json.loads(LIB_FILE.read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def _save_library(items):
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    LIB_FILE.write_text(json.dumps(items, indent=1))
+
+
+def add_to_library(src, size, center, target):
+    """Keep a private copy of the source image and remember the settings. Newest first."""
+    LIB_DIR.mkdir(parents=True, exist_ok=True)
+    src = Path(src)
+    dest = LIB_DIR / src.name
+    if src.resolve() != dest.resolve():
+        shutil.copy2(src, dest)
+    entry = {"name": src.stem, "file": str(dest), "size": int(size),
+             "center": bool(center), "target": target}
+    items = [e for e in load_library() if e != entry]
+    _save_library([entry] + items)
+    return entry
+
+
+def remove_from_library(entry):
+    items = [e for e in load_library() if e != entry]
+    _save_library(items)
+    if not any(e["file"] == entry["file"] for e in items):
+        Path(entry["file"]).unlink(missing_ok=True)
+
+
+def apply_entry(entry):
+    """Switch to a saved cursor. Returns the frame count."""
+    path, n = build_cursor(entry["file"], entry["size"], entry["center"])
+    apply_cursor(path, TARGETS[entry["target"]])
+    return n
