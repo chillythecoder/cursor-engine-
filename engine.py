@@ -71,8 +71,64 @@ def is_native(path):
     return Path(path).suffix.lower() in NATIVE
 
 
+def _decode_cur(data):
+    """Decode the biggest image in a .cur/.ico (BMP or PNG entries) to RGBA, honoring alpha and the AND mask."""
+    _, typ, count = struct.unpack("<HHH", data[:6])
+    if typ not in (1, 2) or count < 1:
+        raise ValueError("not a cursor file")
+    best = None
+    for i in range(count):
+        w, h, _c, _r, _a, _b, size, off = struct.unpack("<BBBBHHII", data[6 + 16 * i:22 + 16 * i])
+        w, h = w or 256, h or 256
+        if best is None or w * h > best[0] * best[1]:
+            best = (w, h, size, off)
+    _, _, size, off = best
+    blob = data[off:off + size]
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return Image.open(io.BytesIO(blob)).convert("RGBA")
+    hsize, w, bh, _pl, bpp, comp = struct.unpack("<IiiHHI", blob[:20])
+    clr_used = struct.unpack("<I", blob[32:36])[0]
+    if comp != 0:
+        raise ValueError("compressed cursor bitmap")
+    h = abs(bh) // 2
+    ncol = (clr_used or (1 << bpp)) if bpp <= 8 else 0
+    pal = blob[hsize:hsize + ncol * 4]
+    pix_off = hsize + ncol * 4
+    stride = ((w * bpp + 31) // 32) * 4
+    xor = blob[pix_off:pix_off + stride * h]
+    if bpp == 32:
+        im = Image.frombuffer("RGBA", (w, h), xor, "raw", "BGRA", stride, -1)
+    elif bpp == 24:
+        im = Image.frombuffer("RGB", (w, h), xor, "raw", "BGR", stride, -1).convert("RGBA")
+    elif bpp in (1, 4, 8):
+        im = Image.frombuffer("P", (w, h), xor, "raw", "P" if bpp == 8 else f"P;{bpp}", stride, -1)
+        im.putpalette([c for i in range(ncol) for c in (pal[4 * i + 2], pal[4 * i + 1], pal[4 * i])])
+        im = im.convert("RGBA")
+    else:
+        raise ValueError(f"{bpp}-bit cursors are not supported")
+    if bpp != 32 or im.getchannel("A").getextrema() == (0, 0):   # transparency lives in the AND mask
+        mstride = ((w + 31) // 32) * 4
+        mdata = blob[pix_off + stride * h:pix_off + stride * h + mstride * h]
+        if len(mdata) >= mstride * h:
+            m = Image.frombuffer("1", (w, h), mdata, "raw", "1", mstride, -1).convert("L")
+            im.putalpha(m.point(lambda v: 0 if v else 255))
+        elif bpp == 32:
+            im.putalpha(255)
+    return im
+
+
 def _open_cur(data):
-    return Image.open(io.BytesIO(data)).convert("RGBA")
+    try:
+        return _decode_cur(data)
+    except Exception:
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+
+
+def placeholder(size=128):
+    from PIL import ImageDraw
+    im = Image.new("RGBA", (size, size), (40, 40, 48, 255))
+    ImageDraw.Draw(im).text((size // 2 - 28, size // 2 - 5), "No preview", fill=(170, 170, 180, 255))
+    return im
 
 
 def read_native(path, max_frames=120):
@@ -126,12 +182,15 @@ def load_any(path, size=48, center=False):
 def build_cursor(src, size=48, center=False):
     """Convert any image/GIF into a cursor file (or reuse a .cur/.ani as-is). Returns (path, frames)."""
     if is_native(src):
-        frames, _ = read_native(src)
+        try:
+            n = len(read_native(src)[0])          # only used to count frames, never blocks applying
+        except Exception:
+            n = 2 if Path(src).suffix.lower() == ".ani" else 1
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         out = OUT_DIR / Path(src).name
         if Path(src).resolve() != out.resolve():
             shutil.copy2(src, out)
-        return out, len(frames)
+        return out, n
     frames, delays, (hx, hy) = load_frames(src, size, center)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     stem = Path(src).stem
